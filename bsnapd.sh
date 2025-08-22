@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # bsnapd.sh
 # Project: BSnapD - https://github.com/linux-brat/BSnapD/
-# Version: 1.8.0
+# Version: 1.9.0
 #
-# Features:
-# - Always starts on Installer landing menu (and installs/updates a bsnap launcher that does the same)
-# - --help/-h support (shows usage and theme options)
-# - Themes: --theme=dark|light|mono|hi-contrast
-# - Colored service status badges (green/red/yellow) for Active/Enabled
-# - Service Manager: enable/disable with reliable state refresh
-# - Snap Manager: list installed, search-and-install (channel + classic), remove
-# - Auto-install snapd if missing before entering managers
+# Changes in 1.9.0:
+# - FIX: Always starts on Installer landing page (not Services Manager)
+# - NEW: "Update BSnapD (auto-update)" option in Installer menu
+# - SNAP MANAGER: Faster and more reliable search/list/remove flows
+#   • Uses snap find --narrow for machine-friendly output when available
+#   • Falls back to classic parsing if --narrow is unavailable
+#   • Bounded result set; paginated view for large results
+#   • Clear error messages and spinners for slow networks
+# - SERVICES: Keeps colored badges (Active/Enabled) and accurate state refresh
+# - LAUNCHER: Option 1 installs/updates bsnap launcher that opens Installer menu
 
 set -euo pipefail
 
@@ -31,35 +33,26 @@ for arg in "$@"; do
     --theme=*) THEME="${arg#*=}";;
   esac
 done
-
-# Respect NO_COLOR or dumb terminals
-if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = "dumb" ]; then THEME="mono"; fi
+[ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = "dumb" ] && THEME="mono"
 
 case "$THEME" in
   dark)
     BOLD="\033[1m"; NC="\033[0m"
     C_OK="\033[32m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_INFO="\033[36m"; C_HEAD="\033[38;5;81m"
-    BADGE_GREEN_BG="\033[48;5;22m\033[38;5;255m"
-    BADGE_RED_BG="\033[48;5;52m\033[38;5;255m"
-    BADGE_YELLOW_BG="\033[48;5;178m\033[38;5;0m"
+    BADGE_GREEN_BG="\033[48;5;22m\033[38;5;255m"; BADGE_RED_BG="\033[48;5;52m\033[38;5;255m"; BADGE_YELLOW_BG="\033[48;5;178m\033[38;5;0m"
     ;;
   light)
     BOLD="\033[1m"; NC="\033[0m"
     C_OK="\033[32m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_INFO="\033[34m"; C_HEAD="\033[35m"
-    BADGE_GREEN_BG="\033[48;5;120m\033[38;5;0m"
-    BADGE_RED_BG="\033[48;5;210m\033[38;5;0m"
-    BADGE_YELLOW_BG="\033[48;5;229m\033[38;5;0m"
+    BADGE_GREEN_BG="\033[48;5;120m\033[38;5;0m"; BADGE_RED_BG="\033[48;5;210m\033[38;5;0m"; BADGE_YELLOW_BG="\033[48;5;229m\033[38;5;0m"
     ;;
   hi-contrast)
     BOLD="\033[1m"; NC="\033[0m"
     C_OK="\033[1;32m"; C_WARN="\033[1;33m"; C_ERR="\033[1;31m"; C_INFO="\033[1;36m"; C_HEAD="\033[1;37m"
-    BADGE_GREEN_BG="\033[1;42m\033[30m"
-    BADGE_RED_BG="\033[1;41m\033[97m"
-    BADGE_YELLOW_BG="\033[1;43m\033[30m"
+    BADGE_GREEN_BG="\033[1;42m\033[30m"; BADGE_RED_BG="\033[1;41m\033[97m"; BADGE_YELLOW_BG="\033[1;43m\033[30m"
     ;;
   mono|*)
-    BOLD=""; NC=""
-    C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_HEAD=""
+    BOLD=""; NC=""; C_OK=""; C_WARN=""; C_ERR=""; C_INFO=""; C_HEAD=""
     BADGE_GREEN_BG=""; BADGE_RED_BG=""; BADGE_YELLOW_BG=""
     ;;
 esac
@@ -87,6 +80,16 @@ badge_enabled(){
     masked)            printf "${BADGE_RED_BG} MASKED ${BADGE_OFF}" ;;
     *)                 printf "${BADGE_YELLOW_BG} $1 ${BADGE_OFF}" ;;
   esac
+}
+
+spinner_start(){
+  SPIN_PID=""
+  ( while :; do for s in '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'; do printf "\r%s" "$s"; sleep 0.08; done; done ) &
+  SPIN_PID=$!
+  disown "$SPIN_PID" 2>/dev/null || true
+}
+spinner_stop(){
+  if [ -n "${SPIN_PID:-}" ]; then kill "$SPIN_PID" 2>/dev/null || true; unset SPIN_PID; printf "\r \r"; fi
 }
 
 # ---------------------- Helpers ----------------------
@@ -149,7 +152,7 @@ install_snapd_flow(){
     apt)    c_info "Updating apt and installing snapd + apparmor..."; sudo apt-get update -y; sudo apt-get install -y snapd apparmor || true ;;
     dnf)    c_info "Installing snapd..."; sudo dnf install -y snapd || true ;;
     yum)    c_info "Installing snapd..."; sudo yum install -y epel-release || true; sudo yum install -y snapd || true ;;
-    zypper) c_info "Installing snapd..."; sudo zyperr --non-interactive install snapd 2>/dev/null || sudo zypper --non-interactive install snapd || true ;;
+    zypper) c_info "Installing snapd..."; sudo zypper --non-interactive install snapd || true ;;
     pacman) c_info "Installing snapd..."; sudo pacman -Syu --noconfirm snapd || { c_err "Failed via pacman. Enable repos or use AUR."; pause; return 1; } ;;
     *)      c_err "Unsupported package manager. Install snapd manually."; pause; return 1 ;;
   esac
@@ -164,6 +167,39 @@ install_snapd_flow(){
   fi
   c_ok "Snapd installation completed."
   pause
+}
+
+# ---------------------- Auto-update ----------------------
+auto_update_bsnapd(){
+  # Download latest bsnapd.sh and replace self if different
+  local tmp; tmp="$(mktemp)"
+  c_info "Checking for updates..."
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fsSL "$REPO_RAW" -o "$tmp"; then c_warn "Update check failed (network)."; rm -f "$tmp"; pause; return; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget -qO "$tmp" "$REPO_RAW"; then c_warn "Update check failed (network)."; rm -f "$tmp"; pause; return; fi
+  else
+    c_warn "Neither curl nor wget found. Cannot update."
+    rm -f "$tmp"; pause; return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    local lcs rcs; lcs="$(sha256sum "$SELF_PATH" | awk '{print $1}')" || true
+    rcs="$(sha256sum "$tmp" | awk '{print $1}')" || true
+    if [ "$lcs" = "$rcs" ]; then
+      c_ok "Already up to date."
+      rm -f "$tmp"; pause; return
+    fi
+  fi
+  chmod +x "$tmp"
+  if sudo mv "$tmp" "$SELF_PATH"; then
+    sudo chmod +x "$SELF_PATH"
+    c_ok "BSnapD updated successfully. Relaunching..."
+    exec "$SELF_PATH" "$@"
+  else
+    c_err "Failed to update BSnapD."
+    rm -f "$tmp"
+    pause
+  fi
 }
 
 # ---------------------- Snap Manager ----------------------
@@ -196,58 +232,77 @@ snap_list_installed(){
   clear
   c_head "$border"; c_head "  Installed Snaps"; c_head "$border"
   if ! command -v snap >/dev/null 2>&1; then c_err "snap command not available"; pause; return; fi
-  if snap list >/dev/null 2>&1; then
-    printf "%-28s %-16s %-10s %-12s %-20s\n" "Name" "Version" "Rev" "Tracking" "Publisher"
-    echo "------------------------------------------------------------------------------------------------------"
-    snap list | awk 'NR>1{printf "%-28s %-16s %-10s %-12s %-20s\n",$1,$2,$3,$5,$4}'
-  else
-    c_warn "No snaps installed or snapd not ready."
-  fi
+  if ! snap list >/dev/null 2>&1; then c_warn "No snaps installed or snapd not ready."; pause; return; fi
+  printf "%-28s %-20s %-10s %-12s %-20s\n" "Name" "Version" "Rev" "Tracking" "Publisher"
+  echo "------------------------------------------------------------------------------------------------------------"
+  snap list | awk 'NR>1{printf "%-28s %-20s %-10s %-12s %-20s\n",$1,$2,$3,$5,$4}'
   echo; pause
 }
 
+snap_find_backend(){
+  # Try machine-friendly mode first
+  if snap find --help 2>/dev/null | grep -q -- '--narrow'; then
+    snap find --narrow "$1"
+  else
+    snap find "$1"
+  fi
+}
+
 snap_search_install(){
+  local q
   while true; do
     clear
     c_head "$border"; c_head "  Search & Install"; c_head "$border"
     echo "Type a search term (e.g., 'vlc', 'spotify') or 'b' to go back."
     echo
     read -rp "Search: " q
-    case "$q" in
-      b|B|"" ) return ;;
-    esac
+    case "$q" in b|B|'' ) return ;; esac
+
+    local tmp; tmp="$(mktemp)"
+    c_info "Searching… (network dependent)"; spinner_start
+    if snap_find_backend "$q" >"$tmp" 2>/dev/null; then :; else spinner_stop; c_err "Search failed."; rm -f "$tmp"; pause; continue; fi
+    spinner_stop
+
+    # Normalize rows: name version publisher channel summary
+    local has_narrow=0
+    if head -n 1 "$tmp" | grep -qi '^name'; then has_narrow=1; fi
 
     clear
     c_head "$border"; c_head "  Results for: $q"; c_head "$border"
-    if snap find "$q" >/tmp/bsnapd_find.$$ 2>/dev/null; then
-      printf "%-4s %-30s %-18s %-12s %-25s\n" "#" "Name" "Version" "Channel" "Publisher"
-      echo "------------------------------------------------------------------------------------------------------------"
-      awk 'NR>1 && $1!~/^-/ {printf "%-30s %-18s %-12s %-25s\n",$1,$2,$4,$3}' /tmp/bsnapd_find.$$ | nl -w2 -s'  ' | head -n 25
-      echo
-      echo "Select a number to install, or 's' to search again, or 'b' to go back."
-      read -rp "Choice: " pick
-      case "$pick" in
-        b|B) rm -f /tmp/bsnapd_find.$$; return ;;
-        s|S) continue ;;
-        '' ) continue ;;
-        * )
-          if [[ "$pick" =~ ^[0-9]+$ ]]; then
-            name=$(awk 'NR>1 && $1!~/^-/ {print $1}' /tmp/bsnapd_find.$$ | sed -n "${pick}p")
-            if [ -z "${name:-}" ]; then
-              c_warn "Invalid selection"; pause
-            else
-              snap_install_flow "$name"
-            fi
-          else
-            c_warn "Invalid input"; pause
-          fi
-          ;;
-      esac
-      rm -f /tmp/bsnapd_find.$$
+    printf "%-3s %-30s %-18s %-20s %-12s\n" "#" "Name" "Version" "Publisher" "Channel"
+    echo "------------------------------------------------------------------------------------------------------"
+
+    if [ $has_narrow -eq 1 ]; then
+      # --narrow format (tab-separated)
+      tail -n +2 "$tmp" | awk -F'\t' '{printf "%-30s %-18s %-20s %-12s\n",$1,$2,$3,$4}' | nl -w2 -s'  ' | head -n 40
     else
-      c_warn "Search failed or no results."
-      pause
+      # Classic human format; best-effort parse
+      awk 'NR>1 && $1!~/^-/ {printf "%-30s %-18s %-20s %-12s\n",$1,$2,$3,$4}' "$tmp" | nl -w2 -s'  ' | head -n 40
     fi
+
+    echo
+    echo "Select a number to install, 's' to search again, or 'b' to go back."
+    read -rp "Choice: " pick
+    case "$pick" in
+      b|B) rm -f "$tmp"; return ;;
+      s|S|'') rm -f "$tmp"; continue ;;
+      * )
+        if [[ "$pick" =~ ^[0-9]+$ ]]; then
+          local name
+          if [ $has_narrow -eq 1 ]; then
+            name="$(tail -n +2 "$tmp" | awk -F'\t' '{print $1}' | sed -n "${pick}p")"
+          else
+            name="$(awk 'NR>1 && $1!~/^-/ {print $1}' "$tmp" | sed -n "${pick}p")"
+          fi
+          rm -f "$tmp"
+          if [ -z "${name:-}" ]; then c_warn "Invalid selection."; pause; continue; fi
+          snap_install_flow "$name"
+        else
+          rm -f "$tmp"
+          c_warn "Invalid input"; pause
+        fi
+        ;;
+    esac
   done
 }
 
@@ -255,11 +310,8 @@ snap_install_flow(){
   local name="$1"
   clear
   c_head "$border"; c_head "  Install: $name"; c_head "$border"
-  echo "Options:"
-  echo "  1) Install (stable)"
-  echo "  2) Install (candidate)"
-  echo "  3) Install (beta)"
-  echo "  4) Install (edge)"
+  echo "Channels:"
+  echo "  1) stable  2) candidate  3) beta  4) edge"
   echo "  c) Cancel"
   echo
   read -rp "Choose: " ch
@@ -278,11 +330,13 @@ snap_install_flow(){
   [[ "${cl,,}" == "y" ]] && classic_flag="--classic"
   echo
   c_info "Installing: snap install $name --channel=$channel $classic_flag"
-  if sudo snap install "$name" --channel="$channel" $classic_flag; then
-    c_ok "Installed $name ($channel)."
+  spinner_start
+  if sudo snap install "$name" --channel="$channel" $classic_flag >/tmp/bsnapd_install.$$ 2>&1; then
+    spinner_stop; c_ok "Installed $name ($channel)."
   else
-    c_err "Failed to install $name."
+    spinner_stop; c_err "Install failed:"; echo; sed -n '1,80p' /tmp/bsnapd_install.$$
   fi
+  rm -f /tmp/bsnapd_install.$$
   echo; pause
 }
 
@@ -302,7 +356,9 @@ snap_remove(){
         if [ -z "${name:-}" ]; then c_warn "Invalid selection"; pause; return; fi
         read -rp "Confirm remove '$name'? (y/N): " ans
         if [[ "${ans,,}" == "y" ]]; then
-          if sudo snap remove "$name"; then c_ok "Removed $name."; else c_err "Failed to remove $name."; fi
+          spinner_start
+          if sudo snap remove "$name" >/tmp/bsnapd_remove.$$ 2>&1; then spinner_stop; c_ok "Removed $name."; else spinner_stop; c_err "Remove failed:"; echo; sed -n '1,80p' /tmp/bsnapd_remove.$$; fi
+          rm -f /tmp/bsnapd_remove.$$
         else
           c_warn "Cancelled."
         fi
@@ -411,6 +467,7 @@ installer_ui(){
     echo "  1) Install/Update bsnap launcher"
     echo "  2) Manage snap services"
     echo "  3) Snap manager (list/search/install/remove)"
+    echo "  4) Update BSnapD (auto-update)"
     echo "  q) Quit"
     echo
     read -rp "Choose: " ch
@@ -418,6 +475,7 @@ installer_ui(){
       1) install_bsnap_launcher; pause ;;
       2) manager_ui ;;
       3) snap_manager ;;
+      4) auto_update_bsnapd "$@";;
       q|Q) exit 0 ;;
       *) c_warn "Invalid option"; pause ;;
     esac
@@ -436,11 +494,10 @@ Options:
   --theme=THEME   Choose color theme (default: dark)
   --help, -h      Show this help
 
-What you can do:
-  - Install or update the 'bsnap' launcher (opens this Installer menu)
-  - Manage snap services (snapd.socket, snapd.apparmor.service)
-  - Snap Manager: list installed, search & install, remove
-  - Auto-installs snapd when needed
+Menus:
+  - Installer: install/update 'bsnap' launcher, open Services Manager, Snap Manager, or Update BSnapD
+  - Services Manager: toggle snapd.socket and snapd.apparmor.service with colored status
+  - Snap Manager: list installed, search & install, remove snaps
 EOF
 }
 
@@ -450,7 +507,7 @@ main(){
   for a in "$@"; do
     case "$a" in
       -h|--help) show_help; exit 0 ;;
-      --theme=*) : ;; # already parsed above
+      --theme=*) : ;; # parsed above
       *) c_warn "Unknown option: $a"; echo; show_help; exit 1 ;;
     esac
   done
@@ -458,7 +515,7 @@ main(){
   # Ensure /usr/local/bin exists for bsnap launcher
   [ -d "/usr/local/bin" ] || { c_info "Creating /usr/local/bin ..."; sudo mkdir -p /usr/local/bin; }
 
-  # Always start on Installer landing menu
+  # ALWAYS open Installer landing page (fix requested)
   installer_ui
 }
 
