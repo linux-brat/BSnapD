@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # bsnapd.sh
 # Project: BSnapD - https://github.com/linux-brat/BSnapD/
-# Version: 1.9.0
+# Version: 2.0.0
 #
-# Changes in 1.9.0:
-# - FIX: Always starts on Installer landing page (not Services Manager)
-# - NEW: "Update BSnapD (auto-update)" option in Installer menu
-# - SNAP MANAGER: Faster and more reliable search/list/remove flows
-#   • Uses snap find --narrow for machine-friendly output when available
-#   • Falls back to classic parsing if --narrow is unavailable
-#   • Bounded result set; paginated view for large results
-#   • Clear error messages and spinners for slow networks
-# - SERVICES: Keeps colored badges (Active/Enabled) and accurate state refresh
-# - LAUNCHER: Option 1 installs/updates bsnap launcher that opens Installer menu
+# New in 2.0.0
+# - Add "Install/Update snapd" feature to the Installer menu
+#   • Detects if snapd is missing or outdated and installs/updates it
+#   • Supports apt, dnf, yum, zypper, pacman
+#   • Enables snapd.socket and snapd.apparmor.service afterward
+#   • Creates /snap symlink when needed
+# - Keeps: Installer-first flow, colored service badges, Snap Manager, bsnap launcher installer, auto-update option
 
 set -euo pipefail
 
@@ -142,36 +139,77 @@ disable_service(){
   fi
 }
 
-install_snapd_flow(){
+install_or_update_snapd(){
   clear
   c_bold "$ASCII_LOGO"; echo
-  c_head "$border"; c_head "  Snapd Installation"; c_head "$border"
+  c_head "$border"; c_head "  Install/Update snapd"; c_head "$border"
+
   local mgr; mgr="$(pkg_mgr)"
   c_info "Detected package manager: $mgr"
+
+  # Quick check: do we already have snapd?
+  if command -v snap >/dev/null 2>&1; then
+    c_ok "snapd appears installed."
+  else
+    c_warn "snapd not detected."
+  fi
+
   case "$mgr" in
-    apt)    c_info "Updating apt and installing snapd + apparmor..."; sudo apt-get update -y; sudo apt-get install -y snapd apparmor || true ;;
-    dnf)    c_info "Installing snapd..."; sudo dnf install -y snapd || true ;;
-    yum)    c_info "Installing snapd..."; sudo yum install -y epel-release || true; sudo yum install -y snapd || true ;;
-    zypper) c_info "Installing snapd..."; sudo zypper --non-interactive install snapd || true ;;
-    pacman) c_info "Installing snapd..."; sudo pacman -Syu --noconfirm snapd || { c_err "Failed via pacman. Enable repos or use AUR."; pause; return 1; } ;;
-    *)      c_err "Unsupported package manager. Install snapd manually."; pause; return 1 ;;
+    apt)
+      c_info "Running apt update..."
+      sudo apt-get update -y
+      c_info "Installing/Upgrading: snapd apparmor"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd apparmor
+      ;;
+    dnf)
+      c_info "Installing/Upgrading: snapd"
+      sudo dnf install -y snapd
+      ;;
+    yum)
+      c_info "Installing/Upgrading: snapd"
+      sudo yum install -y epel-release || true
+      sudo yum install -y snapd
+      ;;
+    zypper)
+      c_info "Installing/Upgrading: snapd"
+      sudo zypper --non-interactive install --force-resolution snapd
+      ;;
+    pacman)
+      c_info "Synchronizing packages and (re)installing snapd"
+      sudo pacman -Syu --noconfirm snapd || {
+        c_err "pacman failed. Ensure required repositories are enabled or use AUR."
+        pause; return 1;
+      }
+      ;;
+    *)
+      c_err "Unsupported package manager. Please install snapd manually."
+      pause; return 1 ;;
   esac
+
   c_info "Enabling snap services..."
   sudo systemctl unmask snapd.socket snapd.apparmor.service >/dev/null 2>&1 || true
   sudo systemctl enable --now snapd.socket || true
   sudo systemctl enable --now snapd.apparmor.service || true
   sudo systemctl daemon-reload || true
+
   if [ ! -e /snap ] && [ -d /var/lib/snapd/snap ]; then
-    c_info "Creating /snap symlink -> /var/lib/snapd/snap ..."
+    c_info "Creating /snap -> /var/lib/snapd/snap symlink..."
     sudo ln -s /var/lib/snapd/snap /snap || true
   fi
-  c_ok "Snapd installation completed."
-  pause
+
+  if command -v snap >/dev/null 2>&1; then
+    c_ok "snapd is installed/updated successfully."
+  else
+    c_warn "snap binary still not found; a reboot or relogin may be required on some distros."
+  fi
+  echo; pause
 }
+
+# Backward-compatible “install only” (used by other flows)
+install_snapd_flow(){ install_or_update_snapd; }
 
 # ---------------------- Auto-update ----------------------
 auto_update_bsnapd(){
-  # Download latest bsnapd.sh and replace self if different
   local tmp; tmp="$(mktemp)"
   c_info "Checking for updates..."
   if command -v curl >/dev/null 2>&1; then
@@ -206,7 +244,7 @@ auto_update_bsnapd(){
 snap_manager(){
   if ! is_snap_installed; then
     c_warn "snap not detected. Installing now..."
-    install_snapd_flow
+    install_or_update_snapd
   fi
   while true; do
     clear
@@ -240,7 +278,6 @@ snap_list_installed(){
 }
 
 snap_find_backend(){
-  # Try machine-friendly mode first
   if snap find --help 2>/dev/null | grep -q -- '--narrow'; then
     snap find --narrow "$1"
   else
@@ -263,7 +300,6 @@ snap_search_install(){
     if snap_find_backend "$q" >"$tmp" 2>/dev/null; then :; else spinner_stop; c_err "Search failed."; rm -f "$tmp"; pause; continue; fi
     spinner_stop
 
-    # Normalize rows: name version publisher channel summary
     local has_narrow=0
     if head -n 1 "$tmp" | grep -qi '^name'; then has_narrow=1; fi
 
@@ -273,10 +309,8 @@ snap_search_install(){
     echo "------------------------------------------------------------------------------------------------------"
 
     if [ $has_narrow -eq 1 ]; then
-      # --narrow format (tab-separated)
       tail -n +2 "$tmp" | awk -F'\t' '{printf "%-30s %-18s %-20s %-12s\n",$1,$2,$3,$4}' | nl -w2 -s'  ' | head -n 40
     else
-      # Classic human format; best-effort parse
       awk 'NR>1 && $1!~/^-/ {printf "%-30s %-18s %-20s %-12s\n",$1,$2,$3,$4}' "$tmp" | nl -w2 -s'  ' | head -n 40
     fi
 
@@ -334,7 +368,7 @@ snap_install_flow(){
   if sudo snap install "$name" --channel="$channel" $classic_flag >/tmp/bsnapd_install.$$ 2>&1; then
     spinner_stop; c_ok "Installed $name ($channel)."
   else
-    spinner_stop; c_err "Install failed:"; echo; sed -n '1,80p' /tmp/bsnapd_install.$$
+    spinner_stop; c_err "Install failed:"; echo; sed -n '1,120p' /tmp/bsnapd_install.$$
   fi
   rm -f /tmp/bsnapd_install.$$
   echo; pause
@@ -357,7 +391,7 @@ snap_remove(){
         read -rp "Confirm remove '$name'? (y/N): " ans
         if [[ "${ans,,}" == "y" ]]; then
           spinner_start
-          if sudo snap remove "$name" >/tmp/bsnapd_remove.$$ 2>&1; then spinner_stop; c_ok "Removed $name."; else spinner_stop; c_err "Remove failed:"; echo; sed -n '1,80p' /tmp/bsnapd_remove.$$; fi
+          if sudo snap remove "$name" >/tmp/bsnapd_remove.$$ 2>&1; then spinner_stop; c_ok "Removed $name."; else spinner_stop; c_err "Remove failed:"; echo; sed -n '1,120p' /tmp/bsnapd_remove.$$; fi
           rm -f /tmp/bsnapd_remove.$$
         else
           c_warn "Cancelled."
@@ -404,8 +438,8 @@ manager_ui(){
     c_bold "$ASCII_LOGO"; echo
     c_head "$border"; c_head "  BSnapD • Snap Services Manager"; c_head "$border"
     if ! is_snap_installed; then
-      c_warn "snap is NOT installed. Installing now..."
-      install_snapd_flow
+      c_warn "snap is NOT installed. Installing/Updating now..."
+      install_or_update_snapd
     fi
     c_ok "snap is installed."
     echo
@@ -468,6 +502,7 @@ installer_ui(){
     echo "  2) Manage snap services"
     echo "  3) Snap manager (list/search/install/remove)"
     echo "  4) Update BSnapD (auto-update)"
+    echo "  5) Install/Update snapd"
     echo "  q) Quit"
     echo
     read -rp "Choose: " ch
@@ -476,6 +511,7 @@ installer_ui(){
       2) manager_ui ;;
       3) snap_manager ;;
       4) auto_update_bsnapd "$@";;
+      5) install_or_update_snapd ;;
       q|Q) exit 0 ;;
       *) c_warn "Invalid option"; pause ;;
     esac
@@ -495,9 +531,11 @@ Options:
   --help, -h      Show this help
 
 Menus:
-  - Installer: install/update 'bsnap' launcher, open Services Manager, Snap Manager, or Update BSnapD
-  - Services Manager: toggle snapd.socket and snapd.apparmor.service with colored status
-  - Snap Manager: list installed, search & install, remove snaps
+  1) Install/Update bsnap launcher
+  2) Manage snap services (colored Active/Enabled badges)
+  3) Snap manager (list/search/install/remove)
+  4) Update BSnapD (auto-update)
+  5) Install/Update snapd (package manager based)
 EOF
 }
 
@@ -515,7 +553,7 @@ main(){
   # Ensure /usr/local/bin exists for bsnap launcher
   [ -d "/usr/local/bin" ] || { c_info "Creating /usr/local/bin ..."; sudo mkdir -p /usr/local/bin; }
 
-  # ALWAYS open Installer landing page (fix requested)
+  # ALWAYS open Installer landing page
   installer_ui
 }
 
